@@ -89,14 +89,29 @@ class Ensemble(nn.ModuleList):
 
 def attempt_load(weights, map_location=None, inplace=True, fuse=True):
     from models.yolo import Detect, Model
+       
+    # Implement for quantization
+    from utils.general import check_yaml
+    cfg = check_yaml(cfg)  # check YAML
+    model_yolo = Model(cfg=cfg)
+    model_yolo.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    torch.backends.quantized.engine = 'fbgemm'
+    model_yolo.fuse_model()
+    model_yolo = torch.quantization.prepare_qat(model_yolo)
+    torch.quantization.convert(model_yolo.eval(), inplace=True)
+    state_dict = torch.load(weights)
+    model_yolo.load_state_dict(state_dict)
+    model_yolo.to('cpu')
 
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
     model = Ensemble()
-    for w in weights if isinstance(weights, list) else [weights]:
-        ckpt = torch.load(attempt_download(w), map_location=map_location)  # load
-        ckpt = (ckpt.get('ema') or ckpt['model']).float()  # FP32 model
-        model.append(ckpt.fuse().eval() if fuse else ckpt.eval())  # fused or un-fused model in eval mode
 
+    # for w in weights if isinstance(weights, list) else [weights]:
+    #     ckpt = torch.load(attempt_download(w), map_location=map_location)  # load
+    #     ckpt = (ckpt.get('ema') or ckpt['model']).float()  # FP32 model
+    #     model.append(ckpt.fuse().eval() if fuse else ckpt.eval())  # fused or un-fused model in eval mode
+
+    model.append(model_yolo.eval())
     # Compatibility updates
     for m in model.modules():
         t = type(m)

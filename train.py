@@ -71,7 +71,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / 'last.pt', w / 'best.pt'
+    last, best, qat_last, qat_best = w / 'last.pt', w / 'best.pt', w / 'qat_last.pt', w / 'qat_best.pt'
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -127,6 +127,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
 
+    # Quantization
+    model.train()
+    model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    torch.backends.quantized.engine = 'fbgemm'
+    model.fuse_model()
+    model = torch.quantization.prepare_qat(model)
+    
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -298,8 +305,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    model.apply(torch.ao.quantization.enable_observer)
+    model.apply(torch.ao.quantization.enable_fake_quant)
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
+        model.cuda()
         model.train()
 
         # Update image weights (optional, single-GPU only)
@@ -353,6 +364,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if opt.quad:
                     loss *= 4.
 
+            # Initialize EMA after one forward, fake_quant shape is changed after forwarding.
+            if ema: ema = ModelEMA(model)
             # Backward
             scaler.scale(loss).backward()
 
@@ -379,23 +392,32 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
+        # with torch.no_grad():
+        with torch.inference_mode():
+            if epoch > 40:
+                # Freeze quantizer parameters
+                model.apply(torch.quantization.disable_observer)
+            if epoch > 35:
+                # Freeze batch norm mean and variance estimates
+                model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
 
         if RANK in (-1, 0):
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            if ema: ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
                 results, maps, _ = val.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
-                                           model=ema.ema,
+                                           model=model,
                                            single_cls=single_cls,
                                            dataloader=val_loader,
                                            save_dir=save_dir,
                                            plots=False,
                                            callbacks=callbacks,
-                                           compute_loss=compute_loss)
+                                           compute_loss=compute_loss,
+                                           half=False)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -405,7 +427,20 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
+
             if (not nosave) or (final_epoch and not evolve):  # if save
+
+                # TODO:design ckpt for quant model.
+                ckpt_qat = {
+                    'epoch': epoch,
+                    'best_fitness': best_fitness,
+                    'model': deepcopy(de_parallel(model)).eval().state_dict(),
+                    'ema': deepcopy(ema.ema).eval().state_dict(),
+                    'updates': ema.updates,
+                    'optimizer': optimizer.state_dict(),
+                    'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
+                    'date': datetime.now().isoformat()}
+
                 ckpt = {
                     'epoch': epoch,
                     'best_fitness': best_fitness,
@@ -415,11 +450,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     'optimizer': optimizer.state_dict(),
                     'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
                     'date': datetime.now().isoformat()}
+                # Save last, best and delete
+                model.to('cpu')
+                torch.save(model.state_dict(), last)
+                torch.save(ckpt_qat, qat_last)
 
                 # Save last, best and delete
-                torch.save(ckpt, last)
+                # torch.save(ckpt, last)
                 if best_fitness == fi:
-                    torch.save(ckpt, best)
+                    model.to('cpu')
+                    torch.save(model.state_dict(), best)
+                    torch.save(ckpt_qat, qat_best)
                 if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
@@ -441,33 +482,91 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
+
     if RANK in (-1, 0):
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
             if f.exists():
-                strip_optimizer(f)  # strip optimizers
+                # strip_optimizer(f)  # strip optimizers
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
                     results, _, _ = val.run(
                         data_dict,
                         batch_size=batch_size // WORLD_SIZE * 2,
                         imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
+                        model = model.cuda(),
                         iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
                         single_cls=single_cls,
                         dataloader=val_loader,
                         save_dir=save_dir,
                         save_json=is_coco,
                         verbose=True,
-                        plots=plots,
+                        plots=True,
                         callbacks=callbacks,
-                        compute_loss=compute_loss)  # val best model with plots
+                        compute_loss=compute_loss,
+                        half=False)  # val best model with plots
+
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
         callbacks.run('on_train_end', last, best, plots, epoch, results)
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
 
+        # TODO: run Val after conversion the best model
+        state_dict = torch.load(best)
+        model.load_state_dict(state_dict)
+        qresults, _, _ = val.run(
+            data_dict,
+            batch_size=batch_size // WORLD_SIZE * 2,
+            imgsz=imgsz,
+            model = model.cuda(),
+            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
+            single_cls=single_cls,
+            dataloader=val_loader,
+            save_dir=save_dir,
+            save_json=is_coco,
+            verbose=True,
+            plots=True,
+            callbacks=callbacks,
+            compute_loss=compute_loss, half=False)  # val best model with plots
+        with torch.no_grad():
+            model.eval()
+            model.cpu()
+            # img = torch.randn(1, 3, 640, 640).to('cpu')
+            # pred = model(img)
+            val.run(
+                data_dict,
+                batch_size=batch_size // WORLD_SIZE * 2,
+                imgsz=imgsz,
+                model=model,
+                iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
+                single_cls=single_cls,
+                dataloader=val_loader,
+                save_dir=save_dir,
+                device='cpu',
+                save_json=is_coco,
+                verbose=True,
+                plots=True,
+                callbacks=callbacks,
+                compute_loss=None, half=False)  # val best model with plots
+        torch.quantization.convert(model, inplace=True)
+        torch.save(model.state_dict(),'quant_model_best.pt')
+
+        val.run(
+            data_dict,
+            batch_size=batch_size // WORLD_SIZE * 2,
+            imgsz=imgsz,
+            model=model,
+            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
+            single_cls=single_cls,
+            dataloader=val_loader,
+            save_dir=save_dir,
+            device='cpu',
+            save_json=is_coco,
+            verbose=True,
+            plots=True,
+            callbacks=callbacks,
+            compute_loss=None, half=False)  # val best model with plots
     torch.cuda.empty_cache()
     return results
 

@@ -126,9 +126,10 @@ def run(
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
-        device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
-        half &= device.type != 'cpu'  # half precision only supported on CUDA
-        model.half() if half else model.float()
+        if device != 'cpu': # add for quantization flow
+            device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
+        # half &= device.type != 'cpu'  # half precision only supported on CUDA
+        # model.half() if half else model.float()
     else:  # called directly
         device = select_device(device, batch_size=batch_size)
 
@@ -154,7 +155,8 @@ def run(
 
     # Configure
     model.eval()
-    cuda = device.type != 'cpu'
+    # cuda = device.type != 'cpu'
+    cuda = device != 'cpu'
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95

@@ -41,7 +41,7 @@ class Conv(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -100,9 +100,10 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_, c2, 3, 1, g=g)
         self.add = shortcut and c1 == c2
-
+        self.skip_add = nn.quantized.FloatFunctional()
     def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        #return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        return self.skip_add.add(x ,self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
@@ -307,7 +308,7 @@ class DetectMultiBackend(nn.Module):
             model = attempt_load(weights if isinstance(weights, list) else w, map_location=device)
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, 'module') else model.names  # get class names
-            model.half() if fp16 else model.float()
+            # model.half() if fp16 else model.float()
             self.model = model  # explicitly assign for to(), cpu(), cuda(), half()
         elif jit:  # TorchScript
             LOGGER.info(f'Loading {w} for TorchScript inference...')
@@ -411,6 +412,7 @@ class DetectMultiBackend(nn.Module):
         # YOLOv5 MultiBackend inference
         b, ch, h, w = im.shape  # batch, channel, height, width
         if self.pt:  # PyTorch
+            
             y = self.model(im, augment=augment, visualize=visualize)[0]
         elif self.jit:  # TorchScript
             y = self.model(im)[0]
