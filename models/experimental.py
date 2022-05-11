@@ -92,13 +92,14 @@ def attempt_load(weights, map_location=None, inplace=True, fuse=True):
        
     # Implement for quantization
     from utils.general import check_yaml
-    cfg = check_yaml(cfg)  # check YAML
+    cfg = check_yaml('models/yolov5s.yaml')  # check YAML
     model_yolo = Model(cfg=cfg)
-    model_yolo.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
-    torch.backends.quantized.engine = 'fbgemm'
+    model_yolo.qconfig = torch.quantization.get_default_qat_qconfig('qnnpack')
+    torch.backends.quantized.engine = 'qnnpack'
     model_yolo.fuse_model()
     model_yolo = torch.quantization.prepare_qat(model_yolo)
     torch.quantization.convert(model_yolo.eval(), inplace=True)
+    # state_dict = torch.load(weights[0])
     state_dict = torch.load(weights)
     model_yolo.load_state_dict(state_dict)
     model_yolo.to('cpu')

@@ -129,8 +129,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Quantization
     model.train()
-    model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
-    torch.backends.quantized.engine = 'fbgemm'
+    model.qconfig = torch.quantization.get_default_qat_qconfig('qnnpack')
+    torch.backends.quantized.engine = 'qnnpack'
     model.fuse_model()
     model = torch.quantization.prepare_qat(model)
     
